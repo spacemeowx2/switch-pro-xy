@@ -148,21 +148,21 @@ async fn real_main(opts: Opts) -> Result<()> {
         }
     });
 
-    let switch_itr_listener = switch_itr.listen(1).context("listen switch_itr")?;
     let switch_ctrl_listener = switch_ctrl.listen(1).context("listen switch_ctrl")?;
+    let switch_itr_listener = switch_itr.listen(1).context("listen switch_itr")?;
 
     adapter.set_discoverable(true).await?;
     if !opts.skip_system {
         system::set_bluetooth_class(adapter.name()).await?;
     }
 
-    let (client_control, control_address) = switch_itr_listener
+    let (switch_ctrl, control_address) = switch_ctrl_listener
         .accept()
         .await
         .context("accept switch_itr")?;
     println!("Got Switch Control Client Connection");
 
-    let (client_interrupt, interrupt_address) = switch_ctrl_listener
+    let (switch_itr, interrupt_address) = switch_itr_listener
         .accept()
         .await
         .context("accept switch_ctrl")?;
@@ -170,15 +170,15 @@ async fn real_main(opts: Opts) -> Result<()> {
 
     unpair_task.abort();
 
-    let ctl_task = bridge_seq_packet("ctrl", ctl_ctrl, client_control);
-    let itr_task = bridge_seq_packet("itr ", ctl_itr, client_interrupt);
+    let ctl_task = bridge_seq_packet("ctrl", &ctl_ctrl, &switch_ctrl);
+    let itr_task = bridge_seq_packet("itr ", &ctl_itr, &switch_itr);
 
     try_join(ctl_task, itr_task).await?;
 
     Ok(())
 }
 
-async fn bridge_seq_packet(name: &str, a: SeqPacket, b: SeqPacket) -> Result<()> {
+async fn bridge_seq_packet(name: &str, a: &SeqPacket, b: &SeqPacket) -> Result<()> {
     let a_b = async {
         let mut buf = [0u8; 1024];
         loop {

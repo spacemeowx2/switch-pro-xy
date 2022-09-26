@@ -1,0 +1,1 @@
+cargo build && sudo ~/shared_target/debug/switch-pro-xy DC:68:EB:39:55:2E 80:D2:E5:80:91:84

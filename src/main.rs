@@ -1,25 +1,34 @@
 use anyhow::{Context, Result};
 use bluer::{
-    l2cap::{SeqPacket, Socket, SocketAddr},
-    rfcomm::{Profile, Role},
+    l2cap::{Socket, SocketAddr},
+    rfcomm::{Profile, ProfileHandle, Role},
     Adapter, AdapterEvent, Address, AddressType, Session,
 };
 use clap::Parser;
-use futures::{future::try_join, stream::StreamExt};
-use std::{process::exit, time::Duration};
-use tokio::{task::JoinHandle, time::sleep};
+use futures::{future::try_join, stream::StreamExt, FutureExt};
+use socket::SeqPacket;
+use std::{
+    process::exit,
+    time::{Duration, Instant},
+};
+use tokio::{
+    sync::mpsc,
+    task::JoinHandle,
+    time::{sleep, timeout},
+};
 use uuid::{uuid, Uuid};
 
 const SDP_UUID: Uuid = uuid!("00001000-0000-1000-8000-00805f9b34fb");
 const SDP: &str = include_str!("./sdp/pro.xml");
 
 mod setup;
+mod socket;
 mod system;
 
 #[derive(Parser, Debug)]
 #[clap(
     name = "switch-pro-xy",
-    about = "A bluetooth proxy between Switch and Pro Controller. ",
+    about = "A bluetooth proxy between Switch and Pro Controller.",
     author = "spacemeowx2",
     version = env!("CARGO_PKG_VERSION"),
 )]
@@ -34,7 +43,11 @@ struct Opts {
     switch_mac: String,
 }
 
-async fn setup_pro_controller(opts: &Opts, session: &Session, adapter: &Adapter) -> Result<()> {
+async fn setup_pro_controller(
+    _opts: &Opts,
+    session: &Session,
+    adapter: &Adapter,
+) -> Result<ProfileHandle> {
     adapter.set_powered(true).await?;
     adapter.set_pairable(true).await?;
     adapter.set_pairable_timeout(0).await?;
@@ -44,7 +57,7 @@ async fn setup_pro_controller(opts: &Opts, session: &Session, adapter: &Adapter)
         .set_alias("Pro Controller".to_string())
         .await
         .context("set alias")?;
-    session
+    let profile_handle = session
         .register_profile(Profile {
             uuid: SDP_UUID,
             service_record: Some(SDP.to_string()),
@@ -58,7 +71,7 @@ async fn setup_pro_controller(opts: &Opts, session: &Session, adapter: &Adapter)
         .await
         .context("register profile")?;
 
-    Ok(())
+    Ok(profile_handle)
 }
 
 async fn real_main(opts: Opts) -> Result<()> {
@@ -67,7 +80,8 @@ async fn real_main(opts: Opts) -> Result<()> {
     let session = bluer::Session::new().await.context("New Session")?;
     let adapter = session.default_adapter().await.context("Adapter")?;
     if !opts.skip_system {
-        system::hci_reset(adapter.name()).await?;
+        // system::hci_reset(adapter.name()).await?;
+        system::restart_bluetooth_service().await?;
     }
     adapter.set_powered(true).await?;
 
@@ -82,6 +96,9 @@ async fn real_main(opts: Opts) -> Result<()> {
     let switch_itr = Socket::new_seq_packet()?;
 
     if let Err(e) = adapter.remove_device(controller_mac).await {
+        println!("Failed to unpair: {:?}", e);
+    }
+    if let Err(e) = adapter.remove_device(switch_mac).await {
         println!("Failed to unpair: {:?}", e);
     }
 
@@ -103,6 +120,11 @@ async fn real_main(opts: Opts) -> Result<()> {
 
     drop(stream);
 
+    adapter
+        .set_alias("Nintendo Switch".to_string())
+        .await
+        .context("set alias")?;
+
     let device = adapter.device(controller_mac).context("device")?;
     if let Err(e) = device.pair().await {
         println!("Pairing failed: {}", e);
@@ -110,23 +132,22 @@ async fn real_main(opts: Opts) -> Result<()> {
 
     println!("Controller Paired");
 
-    adapter
-        .set_alias("Nintendo Switch".to_string())
-        .await
-        .context("set alias")?;
+    let ctl_ctrl = SeqPacket::new(
+        ctl_ctrl
+            .connect(SocketAddr::new(controller_mac, AddressType::BrEdr, 17))
+            .await
+            .context("Connect ctl_ctrl")?,
+    );
+    let ctl_itr = SeqPacket::new(
+        ctl_itr
+            .connect(SocketAddr::new(controller_mac, AddressType::BrEdr, 19))
+            .await
+            .context("Connect ctl_itr")?,
+    );
 
-    let ctl_ctrl = ctl_ctrl
-        .connect(SocketAddr::new(controller_mac, AddressType::BrEdr, 17))
-        .await
-        .context("Connect ctl_ctrl")?;
-    let ctl_itr = ctl_itr
-        .connect(SocketAddr::new(controller_mac, AddressType::BrEdr, 19))
-        .await
-        .context("Connect ctl_itr")?;
+    println!("Got connection. Wait for first report");
 
-    println!("Got connection.");
-
-    setup_pro_controller(&opts, &session, &adapter).await?;
+    let _profile_handle = setup_pro_controller(&opts, &session, &adapter).await?;
 
     println!("Waiting for Switch to connect...");
 
@@ -138,16 +159,6 @@ async fn real_main(opts: Opts) -> Result<()> {
         .bind(SocketAddr::new(bt_addr, AddressType::BrEdr, 19))
         .context("Bind switch_itr")?;
 
-    let task_adapter = adapter.clone();
-    let unpair_task: JoinHandle<()> = tokio::spawn(async move {
-        loop {
-            sleep(Duration::from_secs(10)).await;
-            if let Err(e) = task_adapter.remove_device(switch_mac).await {
-                println!("Failed to unpair: {:?}", e);
-            }
-        }
-    });
-
     let switch_ctrl_listener = switch_ctrl.listen(1).context("listen switch_ctrl")?;
     let switch_itr_listener = switch_itr.listen(1).context("listen switch_itr")?;
 
@@ -156,64 +167,186 @@ async fn real_main(opts: Opts) -> Result<()> {
         system::set_bluetooth_class(adapter.name()).await?;
     }
 
-    let (switch_ctrl, control_address) = switch_ctrl_listener
-        .accept()
-        .await
-        .context("accept switch_itr")?;
-    println!("Got Switch Control Client Connection");
-
-    let (switch_itr, interrupt_address) = switch_itr_listener
+    let (switch_ctrl, _control_address) = switch_ctrl_listener
         .accept()
         .await
         .context("accept switch_ctrl")?;
-    println!("Got Switch Interrupt Client Connection");
 
-    unpair_task.abort();
+    let (switch_itr, _interrupt_address) = switch_itr_listener
+        .accept()
+        .await
+        .context("accept switch_itr")?;
+    let switch_ctrl = SeqPacket::new(switch_ctrl);
+    let switch_itr = SeqPacket::new(switch_itr);
+    switch_itr.set_override_id(true);
 
-    let ctl_task = bridge_seq_packet("ctrl", &ctl_ctrl, &switch_ctrl);
-    let itr_task = bridge_seq_packet("itr ", &ctl_itr, &switch_itr);
+    println!("Got Switch Connection");
+
+    let mut buf = [0u8; 350];
+    let ns_first_packet = loop {
+        forward_one_packet(&ctl_itr, &switch_itr).await?;
+
+        let ns_first_packet_len =
+            match timeout(Duration::from_millis(1000), switch_itr.recv(&mut buf)).await {
+                Ok(len) => len.context("recv ns first packet")?,
+                Err(_) => continue,
+            };
+
+        let ns_first_packet = &buf[..ns_first_packet_len];
+        println!("Got ns first packet {:x?}", ns_first_packet);
+        break ns_first_packet;
+    };
+
+    ctl_itr
+        .send(ns_first_packet)
+        .await
+        .context("send ns first packet")?;
+
+    slow_forward(&ctl_itr, &switch_itr, controller_mac, bt_addr).await?;
+
+    drain_seq_packet(&ctl_itr).await?;
+    println!("Start forwarding packets");
+
+    let ctl_task = forward_seq_packet(ctl_ctrl, switch_ctrl);
+    let itr_task = forward_seq_packet(ctl_itr, switch_itr);
 
     try_join(ctl_task, itr_task).await?;
 
     Ok(())
 }
 
-async fn bridge_seq_packet(name: &str, a: &SeqPacket, b: &SeqPacket) -> Result<()> {
-    let a_b = async {
-        let mut buf = [0u8; 1024];
-        loop {
-            let n = a.recv(&mut buf).await?;
-            println!("{} A -> B: {} {:x?}", name, n, &buf[..n]);
+async fn drain_seq_packet(socket: &SeqPacket) -> Result<()> {
+    let mut buf = [0u8; 350];
+    while let Some(result) = socket.recv(&mut buf).now_or_never() {
+        result?;
+    }
+    Ok(())
+}
 
-            if n == 0 {
+fn replace_mac(buf: &mut [u8], find: Address, replace: Address) {
+    if buf.len() < 6 {
+        return;
+    }
+    // find mac in buf and replace to replace
+    for i in 0..buf.len() - 6 {
+        if buf[i..i + 6] == find.0 {
+            println!("Found mac at {}", i);
+            buf[i..i + 6].copy_from_slice(&replace.0);
+        }
+    }
+}
+
+async fn forward_one_packet(a: &SeqPacket, b: &SeqPacket) -> Result<()> {
+    let mut buf = [0u8; 350];
+    let len = a.recv(&mut buf).await.context("recv")?;
+    let packet = &buf[..len];
+    println!("Forward {:x?}", packet);
+    b.send(packet).await.context("send one packet")?;
+    Ok(())
+}
+
+async fn slow_forward(
+    ctl: &SeqPacket,
+    ns: &SeqPacket,
+    find: Address,
+    replace: Address,
+) -> Result<()> {
+    let mut buf = [0u8; 350];
+
+    'outer: loop {
+        let len = ctl.recv(&mut buf).await.context("recv")?;
+        let packet = &mut buf[..len];
+        replace_mac(packet, find, replace);
+        println!("SLOW CTL -> NS : {:x?}", packet);
+        ns.send(packet).await.context("send slow ctl packet")?;
+
+        let mut is_set_light = false;
+
+        if let Some(result) = ns.recv(&mut buf).now_or_never() {
+            let len = result.context("recv")?;
+            let packet = &buf[..len];
+            println!("SLOW NS  -> CTL: {:x?}", packet);
+            if packet.len() > 11 && packet[11] == 0x30 {
+                is_set_light = true;
+            }
+            ctl.send(packet).await.context("send slow ns packet")?;
+            sleep(Duration::from_millis(66)).await;
+
+            let start = Instant::now();
+            let packet = loop {
+                // timed out, loop again
+                if start.elapsed() > Duration::from_millis(66) {
+                    continue 'outer;
+                }
+                let len = ctl.recv(&mut buf).await.context("recv")?;
+                let packet = &mut buf[..len];
+                // println!("Wait reply {:x?}", packet);
+                // if it's a reply packet, send it
+                if packet.len() >= 14 && packet[14] & 0x80 != 0 {
+                    break packet;
+                }
+            };
+            println!("SLOW CTL -> NS : {:x?}", packet);
+            ns.send(packet)
+                .await
+                .context("send slow reply ctl packet")?;
+
+            if is_set_light {
                 break;
             }
-
-            b.send(&buf[..n]).await?;
         }
-        Ok::<(), anyhow::Error>(())
-    };
-    let b_a = async {
+
+        // 15Hz
+        sleep(Duration::from_millis(66)).await;
+    }
+    Ok(())
+}
+
+/// recv from a, send to b
+async fn forward_seq_packet_one_way(a: SeqPacket, b: SeqPacket) -> Result<()> {
+    let (tx, mut rx) = mpsc::channel(10);
+
+    let recv: JoinHandle<Result<()>> = tokio::spawn(async move {
         let mut buf = [0u8; 1024];
+
         loop {
-            let n = b.recv(&mut buf).await?;
-            println!("{} B -> A: {} {:x?}", name, n, &buf[..n]);
+            let len = a
+                .recv(&mut buf)
+                .await
+                .with_context(|| format!("one_way recv"))?;
 
-            if n == 0 {
-                break;
-            }
-
-            a.send(&buf[..n]).await?;
+            tx.send(buf[..len].to_vec()).await?;
         }
-        Ok::<(), anyhow::Error>(())
-    };
+    });
+
+    let send: JoinHandle<Result<()>> = tokio::spawn(async move {
+        while let Some(buf) = rx.recv().await {
+            println!("send {:?}", Instant::now());
+            b.send(&buf)
+                .await
+                .with_context(|| format!("one_way send"))?;
+        }
+
+        Ok(())
+    });
+
+    recv.await??;
+    send.await??;
+
+    Ok(())
+}
+
+async fn forward_seq_packet(a: SeqPacket, b: SeqPacket) -> Result<()> {
+    let a_b = forward_seq_packet_one_way(a.clone(), b.clone());
+    let b_a = forward_seq_packet_one_way(b, a);
 
     try_join(a_b, b_a).await?;
 
     Ok(())
 }
 
-#[tokio::main(flavor = "current_thread")]
+// #[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
     let opts: Opts = Opts::parse();

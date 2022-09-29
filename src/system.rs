@@ -17,23 +17,6 @@ pub async fn restart_bluetooth_service() -> Result<()> {
     Ok(())
 }
 
-pub async fn hci_reset(name: &str) -> Result<()> {
-    let mut child = Command::new("hciconfig")
-        .arg(name)
-        .arg("reset")
-        .spawn()
-        .context("hci reset")?;
-
-    let status = child.wait().await?;
-
-    if !status.success() {
-        anyhow::bail!("hci reset failed");
-    }
-    println!("reset success");
-
-    Ok(())
-}
-
 pub async fn set_bluetooth_class(name: &str) -> Result<()> {
     let mut child = Command::new("hciconfig")
         .arg(name)
@@ -47,7 +30,7 @@ pub async fn set_bluetooth_class(name: &str) -> Result<()> {
     if !status.success() {
         anyhow::bail!("set bluetooth class failed");
     }
-    println!("set bluetooth class success");
+    // println!("set bluetooth class success");
 
     Ok(())
 }

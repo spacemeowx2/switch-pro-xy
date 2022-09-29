@@ -204,6 +204,8 @@ async fn real_main(opts: Opts) -> Result<()> {
 
     slow_forward(&ctl_itr, &switch_itr, controller_mac, bt_addr).await?;
 
+    println!("About to start forwarding packets. Please close the menu in 5s");
+    sleep(Duration::from_secs(5)).await;
     drain_seq_packet(&ctl_itr).await?;
     println!("Start forwarding packets");
 
@@ -304,34 +306,55 @@ async fn slow_forward(
 
 /// recv from a, send to b
 async fn forward_seq_packet_one_way(a: SeqPacket, b: SeqPacket) -> Result<()> {
-    let (tx, mut rx) = mpsc::channel(10);
+    // let (tx, mut rx) = mpsc::channel(10);
 
-    let recv: JoinHandle<Result<()>> = tokio::spawn(async move {
-        let mut buf = [0u8; 1024];
+    let mut buf = [0u8; 1024];
 
-        loop {
-            let len = a
-                .recv(&mut buf)
-                .await
-                .with_context(|| format!("one_way recv"))?;
+    loop {
+        let len = a
+            .recv(&mut buf)
+            .await
+            .with_context(|| format!("one_way recv"))?;
 
-            tx.send(buf[..len].to_vec()).await?;
-        }
-    });
-
-    let send: JoinHandle<Result<()>> = tokio::spawn(async move {
-        while let Some(buf) = rx.recv().await {
-            println!("send {:?}", Instant::now());
-            b.send(&buf)
-                .await
-                .with_context(|| format!("one_way send"))?;
+        if len == 0 {
+            continue;
         }
 
-        Ok(())
-    });
+        b.send(&buf[..len])
+            .await
+            .with_context(|| format!("one_way send"))?;
+    }
 
-    recv.await??;
-    send.await??;
+    // let recv: JoinHandle<Result<()>> = tokio::spawn(async move {
+    //     let mut buf = [0u8; 1024];
+
+    //     loop {
+    //         let len = a
+    //             .recv(&mut buf)
+    //             .await
+    //             .with_context(|| format!("one_way recv"))?;
+
+    //         if len == 0 {
+    //             continue;
+    //         }
+
+    //         tx.send(buf[..len].to_vec()).await?;
+    //     }
+    // });
+
+    // let send: JoinHandle<Result<()>> = tokio::spawn(async move {
+    //     while let Some(buf) = rx.recv().await {
+    //         // println!("send {:?}", Instant::now());
+    //         b.send(&buf)
+    //             .await
+    //             .with_context(|| format!("one_way send"))?;
+    //     }
+
+    //     Ok(())
+    // });
+
+    // recv.await??;
+    // send.await??;
 
     Ok(())
 }

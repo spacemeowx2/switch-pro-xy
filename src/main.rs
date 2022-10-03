@@ -306,8 +306,6 @@ async fn slow_forward(
 
 /// recv from a, send to b
 async fn forward_seq_packet_one_way(a: SeqPacket, b: SeqPacket) -> Result<()> {
-    // let (tx, mut rx) = mpsc::channel(10);
-
     let mut buf = [0u8; 1024];
 
     loop {
@@ -324,37 +322,6 @@ async fn forward_seq_packet_one_way(a: SeqPacket, b: SeqPacket) -> Result<()> {
             .await
             .with_context(|| format!("one_way send"))?;
     }
-
-    // let recv: JoinHandle<Result<()>> = tokio::spawn(async move {
-    //     let mut buf = [0u8; 1024];
-
-    //     loop {
-    //         let len = a
-    //             .recv(&mut buf)
-    //             .await
-    //             .with_context(|| format!("one_way recv"))?;
-
-    //         if len == 0 {
-    //             continue;
-    //         }
-
-    //         tx.send(buf[..len].to_vec()).await?;
-    //     }
-    // });
-
-    // let send: JoinHandle<Result<()>> = tokio::spawn(async move {
-    //     while let Some(buf) = rx.recv().await {
-    //         // println!("send {:?}", Instant::now());
-    //         b.send(&buf)
-    //             .await
-    //             .with_context(|| format!("one_way send"))?;
-    //     }
-
-    //     Ok(())
-    // });
-
-    // recv.await??;
-    // send.await??;
 
     Ok(())
 }

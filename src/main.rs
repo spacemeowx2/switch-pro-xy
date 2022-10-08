@@ -9,11 +9,12 @@ use futures::{future::try_join, stream::StreamExt, FutureExt};
 use socket::SeqPacket;
 use std::{
     process::exit,
+    task::Poll,
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::mpsc,
-    task::JoinHandle,
+    io::ReadBuf,
+    task::{spawn_blocking, JoinHandle},
     time::{sleep, timeout},
 };
 use uuid::{uuid, Uuid};
@@ -24,6 +25,7 @@ const SDP: &str = include_str!("./sdp/pro.xml");
 mod setup;
 mod socket;
 mod system;
+mod util;
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -145,7 +147,7 @@ async fn real_main(opts: Opts) -> Result<()> {
             .context("Connect ctl_itr")?,
     );
 
-    println!("Got connection. Wait for first report");
+    println!("Got connection.");
 
     let _profile_handle = setup_pro_controller(&opts, &session, &adapter).await?;
 
@@ -178,7 +180,6 @@ async fn real_main(opts: Opts) -> Result<()> {
         .context("accept switch_itr")?;
     let switch_ctrl = SeqPacket::new(switch_ctrl);
     let switch_itr = SeqPacket::new(switch_itr);
-    switch_itr.set_override_id(true);
 
     println!("Got Switch Connection");
 
@@ -209,8 +210,8 @@ async fn real_main(opts: Opts) -> Result<()> {
     drain_seq_packet(&ctl_itr).await?;
     println!("Start forwarding packets");
 
-    let ctl_task = forward_seq_packet(ctl_ctrl, switch_ctrl);
-    let itr_task = forward_seq_packet(ctl_itr, switch_itr);
+    let ctl_task = forward_seq_packet(ctl_ctrl, switch_ctrl, false);
+    let itr_task = forward_seq_packet(ctl_itr, switch_itr, true);
 
     try_join(ctl_task, itr_task).await?;
 
@@ -305,38 +306,57 @@ async fn slow_forward(
 }
 
 /// recv from a, send to b
-async fn forward_seq_packet_one_way(a: SeqPacket, b: SeqPacket) -> Result<()> {
-    let mut buf = [0u8; 1024];
+async fn forward_seq_packet_one_way(a: SeqPacket, b: SeqPacket, low_latency: bool) -> Result<()> {
+    if low_latency {
+        let handle: JoinHandle<Result<()>> = spawn_blocking(move || {
+            let mut buf = [0u8; 350];
+            let mut read_buf = ReadBuf::new(&mut buf);
 
-    loop {
-        let len = a
-            .recv(&mut buf)
-            .await
-            .with_context(|| format!("one_way recv"))?;
+            loop {
+                read_buf.clear();
+                if let Poll::Ready(()) = a.poll_recv(&mut read_buf)? {
+                    while let Poll::Pending = b.poll_send(read_buf.filled())? {}
+                }
+            }
+        });
 
-        if len == 0 {
-            continue;
+        handle.await??;
+
+        Ok(())
+    } else {
+        let mut buf = [0u8; 1024];
+
+        loop {
+            let len = a
+                .recv(&mut buf)
+                .await
+                .with_context(|| format!("one_way recv"))?;
+
+            if len == 0 {
+                continue;
+            }
+
+            b.send(&buf[..len])
+                .await
+                .with_context(|| format!("one_way send"))?;
         }
-
-        b.send(&buf[..len])
-            .await
-            .with_context(|| format!("one_way send"))?;
     }
-
-    Ok(())
 }
 
-async fn forward_seq_packet(a: SeqPacket, b: SeqPacket) -> Result<()> {
-    let a_b = forward_seq_packet_one_way(a.clone(), b.clone());
-    let b_a = forward_seq_packet_one_way(b, a);
+async fn forward_seq_packet(a: SeqPacket, b: SeqPacket, low_latency: bool) -> Result<()> {
+    if low_latency {
+        util::remove_non_blocking(a.get_fd())?;
+        util::remove_non_blocking(b.get_fd())?;
+    }
+    let a_b = forward_seq_packet_one_way(a.clone(), b.clone(), low_latency);
+    let b_a = forward_seq_packet_one_way(b, a, low_latency);
 
     try_join(a_b, b_a).await?;
 
     Ok(())
 }
 
-// #[tokio::main(flavor = "current_thread")]
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     env_logger::init();
     let opts: Opts = Opts::parse();
